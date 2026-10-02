@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>大图叠加：imageOverlay vs 动态瓦片</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body { margin: 0; height: 100%; font: 14px/1.6 system-ui,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+    #map { position: absolute; inset: 0; }
+    .panel {
+      position: absolute; top: 12px; left: 50px; z-index: 1000; width: 320px;
+      background: rgba(15,26,20,.9); color: #e7f0e9; border: 1px solid #28402f;
+      border-radius: 12px; padding: 12px 14px; backdrop-filter: blur(6px);
+    }
+    .panel h1 { font-size: 15px; margin: 0 0 6px; }
+    .panel p { color: #8fa89a; margin: 0 0 10px; font-size: 12px; }
+    .modes { display: flex; flex-direction: column; gap: 6px; }
+    button { text-align: left; cursor: pointer; border: 1px solid #28402f; background: #1d3327; color: #e7f0e9; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
+    button:hover { border-color: #22c55e; }
+    button.on { background: #22c55e; color: #06210f; border-color: #22c55e; font-weight: 600; }
+    .note { margin-top: 10px; font-size: 12px; color: #9be29b; min-height: 34px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>大图叠加的三种做法</h1>
+    <p>把一张 <b>2048×2048</b> 的大图贴到地图上，滚动缩放感受差别（大图放大时最明显）。</p>
+    <div class="modes">
+      <button id="m1" data-mode="image">① imageOverlay（默认）</button>
+      <button id="m2" data-mode="image-noanim">② imageOverlay + 关缩放动画</button>
+      <button id="m3" data-mode="grid">③ 自定义 GridLayer 动态 256 瓦片</button>
+    </div>
+    <div class="note" id="note"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const BOUNDS = [[43.93, 126.46], [43.97, 126.50]]; // NE/SW，示例区域
+    const CENTER = [43.95, 126.48];
+
+    // —— 造一张 2048×2048 的大图（真实场景是后端出的 NDVI PNG）——
+    const SRC = document.createElement('canvas');
+    SRC.width = SRC.height = 2048;
+    (function paint() {
+      const ctx = SRC.getContext('2d');
+      const ramp = ctx.createLinearGradient(0, 0, 2048, 2048);
+      ramp.addColorStop(0, '#f97316'); ramp.addColorStop(0.5, '#facc15'); ramp.addColorStop(1, '#15803d');
+      ctx.fillStyle = ramp; ctx.fillRect(0, 0, 2048, 2048);
+      let s = 7; const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+      for (let i = 0; i < 60; i++) {
+        ctx.beginPath();
+        ctx.arc(rnd() * 2048, rnd() * 2048, 20 + rnd() * 160, 0, Math.PI * 2);
+        ctx.fillStyle = rnd() > 0.5 ? 'rgba(21,128,61,.5)' : 'rgba(249,115,22,.4)';
+        ctx.fill();
+      }
+    })();
+    const SRC_URL = SRC.toDataURL('image/png');
+
+    const NOTE = {
+      image: '整个 2048 位图当一张图贴上去：缩放时浏览器要把整张大图重新采样，最容易卡。',
+      'image-noanim': '关掉 zoomAnimation，缩放直接跳档、不重采样，成本最低（代价：没有平滑过渡）。',
+      grid: '自己 extend GridLayer，按 z/x/y 把大图对应区域裁成 256 瓦片：每块单独画，主线程压力小、缩放丝滑。',
+    };
+
+    // —— 自定义 GridLayer：按瓦片裁剪源图 ——
+    const NDVIGrid = L.GridLayer.extend({
+      createTile: function (coords) {
+        const tile = document.createElement('canvas');
+        tile.width = tile.height = 256;
+        const ctx = tile.getContext('2d');
+        const z = coords.z;
+        // 该瓦片的 NW / SE 地理角
+        const nw = this._map.unproject([coords.x * 256, coords.y * 256], z);
+        const se = this._map.unproject([(coords.x + 1) * 256, (coords.y + 1) * 256], z);
+        const b = L.latLngBounds(BOUNDS);
+        const W = b.getWest(), E = b.getEast(), N = b.getNorth(), S = b.getSouth();
+        // 瓦片 → 源图像素矩形（小区域，线性近似足够）
+        const fx0 = (nw.lng - W) / (E - W), fy0 = (N - nw.lat) / (N - S);
+        const fx1 = (se.lng - W) / (E - W), fy1 = (N - se.lat) / (N - S);
+        const sx = fx0 * SRC.width, sy = fy0 * SRC.height;
+        const sw = (fx1 - fx0) * SRC.width, sh = (fy1 - fy0) * SRC.height;
+        if (sw > 0 && sh > 0) ctx.drawImage(SRC, sx, sy, sw, sh, 0, 0, 256, 256);
+        return tile;
+      }
+    });
+
+    let map = null;
+    let overlay = null;
+
+    function setup(mode) {
+      if (map) { map.remove(); map = null; }
+
+      const opts = mode === 'image-noanim'
+        ? { zoomAnimation: false, fadeAnimation: false, markerZoomAnimation: false, zoomSnap: 1, zoomDelta: 1 }
+        : { zoomSnap: 1, zoomDelta: 1 };
+      map = L.map('map', opts).setView(CENTER, 14);
+
+      L.tileLayer('https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}', {
+        subdomains: ['1', '2', '3', '4'], maxZoom: 19, attribution: '© 高德地图'
+      }).addTo(map);
+
+      if (mode === 'grid') {
+        overlay = new NDVIGrid({ minZoom: 12, maxZoom: 18, opacity: 0.72, updateWhenZooming: false, keepBuffer: 4 });
+      } else {
+        overlay = L.imageOverlay(SRC_URL, BOUNDS, { opacity: 0.72 });
+      }
+      overlay.addTo(map);
+
+      document.getElementById('note').textContent = NOTE[mode];
+      document.querySelectorAll('.modes button').forEach(function (b) {
+        b.className = b.dataset.mode === mode ? 'on' : '';
+      });
+    }
+
+    document.querySelectorAll('.modes button').forEach(function (b) {
+      b.addEventListener('click', function () { setup(b.dataset.mode); });
+    });
+
+    setup('image');
+  </script>
+</body>
+</html>
